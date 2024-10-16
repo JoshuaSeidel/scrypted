@@ -1,5 +1,5 @@
 import { sleep } from '@scrypted/common/src/sleep';
-import sdk, { Camera, Device, DeviceCreatorSettings, DeviceInformation, DeviceProvider, Intercom, MediaObject, ObjectDetectionTypes, ObjectDetector, ObjectsDetected, OnOff, PanTiltZoom, PanTiltZoomCommand, Reboot, RequestPictureOptions, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, Setting } from "@scrypted/sdk";
+import sdk, { Camera, Device, DeviceCreatorSettings, DeviceInformation, DeviceProvider, FFmpegInput, Intercom, MediaObject, ObjectDetectionTypes, ObjectDetector, ObjectsDetected, OnOff, PanTiltZoom, PanTiltZoomCommand, Reboot, RequestPictureOptions, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, Setting, VideoClip, VideoClipOptions, VideoClips, VideoClipThumbnailOptions } from "@scrypted/sdk";
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import { EventEmitter } from "stream";
 import { createRtspMediaStreamOptions, Destroyable, RtspProvider, RtspSmartCamera, UrlMediaStreamOptions } from "../../rtsp/src/rtsp";
@@ -7,7 +7,7 @@ import { OnvifCameraAPI, OnvifEvent, connectCameraAPI } from './onvif-api';
 import { listenEvents } from './onvif-events';
 import { OnvifIntercom } from './onvif-intercom';
 import { DevInfo } from './probe';
-import { AIState, Enc, ReolinkCameraClient } from './reolink-api';
+import { AIState, Enc, ReolinkCameraClient, VideoSearchResult, VideoSearchTime } from './reolink-api';
 
 class ReolinkCameraSiren extends ScryptedDeviceBase implements OnOff {
     sirenTimeout: NodeJS.Timeout;
@@ -50,7 +50,7 @@ class ReolinkCameraSiren extends ScryptedDeviceBase implements OnOff {
     }
 }
 
-class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, Reboot, Intercom, ObjectDetector, PanTiltZoom {
+class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, Reboot, Intercom, ObjectDetector, PanTiltZoom, VideoClips {
     client: ReolinkCameraClient;
     onvifClient: OnvifCameraAPI;
     onvifIntercom = new OnvifIntercom(this);
@@ -145,7 +145,7 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
             subgroup: 'Advanced',
             title: 'Use ONVIF for Two-Way Audio',
             type: 'boolean',
-        },
+        }
     });
 
     constructor(nativeId: string, provider: RtspProvider) {
@@ -746,6 +746,87 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
         return sirenNativeId;
     }
 
+    async getVideoClips(options?: VideoClipOptions): Promise<VideoClip[]> {
+        const response = await this.client.getVideoClips(options);
+
+        const processDate = (date: VideoSearchTime) => {
+            let timeDate = new Date();
+
+            timeDate.setFullYear(date.year);
+            timeDate.setMonth(date.mon - 1);
+            timeDate.setDate(date.day);
+            timeDate.setHours(date.hour);
+            timeDate.setMinutes(date.min);
+            timeDate.setSeconds(date.sec);
+
+            return timeDate.getTime();
+        }
+        const ep = await sdk.endpointManager.getLocalEndpoint();
+
+        return response.map<VideoClip>(videoClip => {
+            const startTime = processDate(videoClip.StartTime);
+            const entdTime = processDate(videoClip.EndTime);
+
+            const durationInMs = entdTime - startTime;
+            const videoClipname = videoClip.name;
+
+
+            return {
+                id: videoClipname,
+                startTime,
+                duration: Math.round(durationInMs),
+                videoId: videoClipname,
+                thumbnailId: videoClipname,
+                resources: {
+                    thumbnail: {
+                        href: 'https://ha.gianlucaruocco.top/local/snapshots/baby_monitor.jpg',
+                        // href: new URL(`thumbnail/${this.id}/${videoClipname}`, ep).pathname,
+                    },
+                    // video: {
+                    //     href: videoClipname
+                    // }
+                }
+            }
+        });
+    }
+
+    async getVideoClip(videoId: string): Promise<MediaObject> {
+        this.console.log('Requiring videoclip ', videoId);
+
+        try {
+            const videoclipUrl = await this.client.getVideoClipUrl(videoId);
+            this.console.log('Videoclip url', videoclipUrl);
+            return sdk.mediaManager.createMediaObjectFromUrl(videoclipUrl);
+        } catch (e) {
+            this.console.log(`Failed fetching videoclip ${videoId}`, e);
+        }
+    }
+
+    async getVideoClipThumbnail(thumbnailId: string, _?: VideoClipThumbnailOptions): Promise<MediaObject> {
+        this.console.log('Requiring videoclip thumbnailId', thumbnailId);
+
+        try {
+            // const videoclipUrl = await this.client.getVideoClipUrl(thumbnailId);
+            const ffmpegInput: FFmpegInput = {
+                inputArguments: [
+                    // it may be h264 or h265.
+                    // '-f', 'h264',
+                    '-i', 'https://ha.gianlucaruocco.top/local/snapshots/baby_monitor.jpg',
+                ]
+            };
+            const input = await sdk.mediaManager.createFFmpegMediaObject(ffmpegInput);
+            const jpeg = await sdk.mediaManager.convertMediaObjectToBuffer(input, 'image/jpeg');
+            return await sdk.mediaManager.createMediaObject(jpeg, 'image/jpeg');
+            // return await sdk.mediaManager.createMediaObjectFromUrl('https://ha.gianlucaruocco.top/local/snapshots/baby_monitor.jpg');
+        } catch (e) {
+            this.console.error(`Error generating thumbnail ${thumbnailId}`, e);
+        }
+    }
+
+    async removeVideoClips(...videoClipIds: string[]): Promise<void> {
+        throw new Error('Removing video clips not supported.');
+    }
+
     async getDevice(nativeId: string): Promise<any> {
         if (nativeId.endsWith('-siren')) {
             this.siren ||= new ReolinkCameraSiren(this, nativeId);
@@ -772,6 +853,7 @@ class ReolinkProvider extends RtspProvider {
             ScryptedInterface.Camera,
             ScryptedInterface.AudioSensor,
             ScryptedInterface.MotionSensor,
+            ScryptedInterface.VideoClips,
         ];
     }
 

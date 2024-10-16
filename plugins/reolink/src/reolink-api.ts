@@ -3,7 +3,7 @@ import { PassThrough, Readable } from 'stream';
 import { HttpFetchOptions } from '../../../server/src/fetch/http-fetch';
 
 import { sleep } from "@scrypted/common/src/sleep";
-import { PanTiltZoomCommand } from "@scrypted/sdk";
+import { PanTiltZoomCommand, VideoClipOptions } from "@scrypted/sdk";
 import { DevInfo, getLoginParameters, getToken } from './probe';
 
 export interface Enc {
@@ -49,6 +49,28 @@ interface TokenData {
     leaseTime: number;
 }
 
+export interface VideoSearchTime {
+    day: number;
+    hour: number;
+    min: number;
+    mon: number;
+    sec: number;
+    year: number;
+}
+
+export interface VideoSearchResult {
+    EndTime: VideoSearchTime;
+    StartTime: VideoSearchTime;
+    frameRate: number;
+    height: number;
+    name: string;
+    size: number;
+    type: number;
+    width: number;
+}
+
+export type VideoSearchType = 'sub' | 'main';
+
 export class ReolinkCameraClient {
     credential: AuthFetchCredentialState;
     parameters: Record<string, string>;
@@ -91,7 +113,8 @@ export class ReolinkCameraClient {
         this.tokenLease = Date.now() + 1000 * leaseTimeSeconds;
     }
 
-    async requestWithToken(options: HttpFetchOptions<Readable>, body?: Readable) {
+    async getTokenData() {
+        this.console.log(this.tokenData);
         if (!this.tokenData?.token || !this.tokenData.leaseTime || this.tokenData.leaseTime > Date.now()) {
             this.console.log(`token expired at ${this.tokenLease}, renewing...`);
 
@@ -99,9 +122,14 @@ export class ReolinkCameraClient {
             this.tokenData = { leaseTime: leaseTimeSeconds, token };
         }
 
+        return this.tokenData;
+    }
+
+    async requestWithToken(options: HttpFetchOptions<Readable>, body?: Readable) {
+        const { token } = await this.getTokenData();
         const url = options.url as URL;
         const params = url.searchParams;
-        params.set('token', this.tokenData.token);
+        params.set('token', token);
 
         return this.request(options, body);
     }
@@ -211,7 +239,7 @@ export class ReolinkCameraClient {
         });
         const error = response.body?.[0]?.error;
         if (error) {
-            this.console.error('error during call to getAbility, trying enforcing the token', error);
+            this.console.log('error during call to getAbility, trying enforcing the token', error);
             return this.getAbilityWithToken();
         }
         return {
@@ -420,5 +448,69 @@ export class ReolinkCameraClient {
             value: (response.body?.[0]?.value || response.body?.value) as SirenResponse,
             data: response.body,
         };
+    }
+
+    async getVideoClips(options?: VideoClipOptions, streamType: VideoSearchType = 'main') {
+        const url = new URL(`http://${this.host}/api.cgi`);
+        const params = url.searchParams;
+        params.set('cmd', 'Search');
+
+        const startTime = new Date(options.startTime);
+        let endTime = options.endTime ? new Date(options.endTime) : undefined;
+
+        // If the endTime is not the same day as startTime, 
+        // or no endDate is provided, set to the end of the startTime
+        // Reolink only supports 1 day recordings fetching
+        if (!endTime || endTime.getDate() > startTime.getDate()) {
+            endTime = new Date(startTime);
+            endTime.setHours(23);
+            endTime.setMinutes(59);
+            endTime.setSeconds(59);
+        }
+
+        const response = await this.requestWithLogin({
+            url,
+            method: 'POST',
+            responseType: 'json',
+        }, this.createReadable([
+            {
+                cmd: "Search",
+                action: 1,
+                param: {
+                    Search: {
+                        channel: this.channelId,
+                        streamType,
+                        onlyStatus: 0,
+                        StartTime: {
+                            year: startTime.getFullYear(),
+                            mon: startTime.getMonth() + 1,
+                            day: startTime.getDate(),
+                            hour: startTime.getHours(),
+                            min: startTime.getMinutes(),
+                            sec: startTime.getSeconds()
+                        },
+                        EndTime: {
+                            year: endTime.getFullYear(),
+                            mon: endTime.getMonth() + 1,
+                            day: endTime.getDate(),
+                            hour: endTime.getHours(),
+                            min: endTime.getMinutes(),
+                            sec: endTime.getSeconds()
+                        }
+                    }
+                }
+            }
+        ]));
+
+        return (response.body?.[0]?.value?.SearchResult?.File ?? []) as VideoSearchResult[];
+    }
+
+    async getVideoClipUrl(fileName: string) {
+        const { token } = await this.getTokenData();
+        if (!token) {
+            throw new Error('Token is not available');
+        }
+
+        return `http://${this.host}/api.cgi?cmd=Download&source=${fileName}&output=${fileName.split('/').pop()}&token=${token}`;
     }
 }
