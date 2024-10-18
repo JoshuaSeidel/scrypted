@@ -4,7 +4,8 @@ import { HttpFetchOptions } from '../../../server/src/fetch/http-fetch';
 
 import { sleep } from "@scrypted/common/src/sleep";
 import { PanTiltZoomCommand, VideoClipOptions } from "@scrypted/sdk";
-import { DevInfo, getLoginParameters, getToken } from './probe';
+import { DevInfo, getToken } from './probe';
+import { ReolinkCamera } from './main';
 
 export interface Enc {
     audio: number;
@@ -44,11 +45,6 @@ export interface PtzPreset {
     name: string;
 }
 
-interface TokenData {
-    token: string;
-    leaseTime: number;
-}
-
 export interface VideoSearchTime {
     day: number;
     hour: number;
@@ -73,15 +69,42 @@ export type VideoSearchType = 'sub' | 'main';
 
 export class ReolinkCameraClient {
     credential: AuthFetchCredentialState;
-    parameters: Record<string, string>;
-    tokenLease: number;
-    tokenData: TokenData;
 
-    constructor(public host: string, public username: string, public password: string, public channelId: number, public console: Console) {
+    constructor(
+        public host: string,
+        public username: string,
+        public password: string,
+        public channelId: number,
+        public console: Console,
+        public device: ReolinkCamera
+    ) {
         this.credential = {
             username,
             password,
         };
+    }
+
+    public async getTokenData() {
+        let { token: currentToken, tokenLease: currentTokenLease } = await this.device.getTokenData();
+
+        if (currentTokenLease) {
+            currentTokenLease = Number(currentTokenLease);
+        }
+
+        if (!currentToken || !currentTokenLease || Date.now() > Number(currentTokenLease)) {
+            this.console.log(`token expired, renewing... Token: ${currentToken}, TokenLease: ${currentTokenLease}, Now: ${Date.now()}`);
+
+            try {
+                const { leaseTimeSeconds, parameters: { token } } = await getToken(this.host, this.username, this.password);
+                const tokenLease = Date.now() + 1000 * leaseTimeSeconds;
+                this.console.log(`Token ${token} created. Will expire at ${new Date(tokenLease).toLocaleString()} `);
+
+                await this.device.putTokenData(token, tokenLease);
+            } catch (e) {
+                this.console.log('error creating token', e)
+            }
+        }
+        return await this.device.getTokenData();
     }
 
     private async request(options: HttpFetchOptions<Readable>, body?: Readable) {
@@ -101,47 +124,21 @@ export class ReolinkCameraClient {
         return pt;
     }
 
-    async login() {
-        if (this.tokenLease > Date.now()) {
-            return;
-        }
-
-        this.console.log(`token expired at ${this.tokenLease}, renewing...`);
-
-        const { parameters, leaseTimeSeconds } = await getLoginParameters(this.host, this.username, this.password);
-        this.parameters = parameters
-        this.tokenLease = Date.now() + 1000 * leaseTimeSeconds;
-    }
-
-    async getTokenData() {
-        this.console.log(this.tokenData);
-        if (!this.tokenData?.token || !this.tokenData.leaseTime || this.tokenData.leaseTime > Date.now()) {
-            this.console.log(`token expired at ${this.tokenLease}, renewing...`);
-
-            const { leaseTimeSeconds, parameters: { token } } = await getToken(this.host, this.username, this.password);
-            this.tokenData = { leaseTime: leaseTimeSeconds, token };
-        }
-
-        return this.tokenData;
-    }
-
-    async requestWithToken(options: HttpFetchOptions<Readable>, body?: Readable) {
+    async requestWithLogin(options: HttpFetchOptions<Readable>, body?: Readable) {
         const { token } = await this.getTokenData();
         const url = options.url as URL;
         const params = url.searchParams;
-        params.set('token', token);
+        params.set('token', String(token));
 
-        return this.request(options, body);
-    }
+        const response = await this.request(options, body);
 
-    async requestWithLogin(options: HttpFetchOptions<Readable>, body?: Readable) {
-        await this.login();
-        const url = options.url as URL;
-        const params = url.searchParams;
-        for (const [k, v] of Object.entries(this.parameters)) {
-            params.set(k, v);
+        const error = response.body?.find(item => !!item.error)?.error;
+
+        if (error === -6) {
+            this.device.putTokenData(undefined, undefined);
         }
-        return this.request(options, body);
+
+        return response;
     }
 
     async reboot() {
@@ -197,7 +194,7 @@ export class ReolinkCameraClient {
         };
     }
 
-    async getAbilityWithToken() {
+    async getAbility() {
         const url = new URL(`http://${this.host}/api.cgi`);
         const params = url.searchParams;
         params.set('cmd', 'GetAbility');
@@ -212,7 +209,7 @@ export class ReolinkCameraClient {
             }
         }];
 
-        const response = await this.requestWithToken({
+        const response = await this.requestWithLogin({
             url,
             responseType: 'json',
             method: 'POST',
@@ -222,26 +219,6 @@ export class ReolinkCameraClient {
             throw new Error('error during call to getAbilityWithToken');
         }
 
-        return {
-            value: response.body?.[0]?.value || response.body?.value,
-            data: response.body,
-        };
-    }
-
-    async getAbility() {
-        const url = new URL(`http://${this.host}/api.cgi`);
-        const params = url.searchParams;
-        params.set('cmd', 'GetAbility');
-        params.set('channel', this.channelId.toString());
-        const response = await this.requestWithLogin({
-            url,
-            responseType: 'json',
-        });
-        const error = response.body?.[0]?.error;
-        if (error) {
-            this.console.log('error during call to getAbility, trying enforcing the token', error);
-            return this.getAbilityWithToken();
-        }
         return {
             value: response.body?.[0]?.value || response.body?.value,
             data: response.body,
@@ -505,12 +482,17 @@ export class ReolinkCameraClient {
         return (response.body?.[0]?.value?.SearchResult?.File ?? []) as VideoSearchResult[];
     }
 
-    async getVideoClipUrl(fileName: string) {
+    async getVideoClipUrl(videoclipPath: string) {
         const { token } = await this.getTokenData();
         if (!token) {
             throw new Error('Token is not available');
         }
 
-        return `http://${this.host}/api.cgi?cmd=Download&source=${fileName}&output=${fileName.split('/').pop()}&token=${token}`;
+        const fileName = videoclipPath.split('/').pop().split('.').shift();
+
+        return {
+            url: `http://${this.host}/api.cgi?cmd=Download&source=${videoclipPath}&output=${fileName}&token=${token}`,
+            fileName,
+        };
     }
 }

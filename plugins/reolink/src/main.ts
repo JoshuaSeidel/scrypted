@@ -1,5 +1,5 @@
 import { sleep } from '@scrypted/common/src/sleep';
-import sdk, { Camera, Device, DeviceCreatorSettings, DeviceInformation, DeviceProvider, FFmpegInput, Intercom, MediaObject, ObjectDetectionTypes, ObjectDetector, ObjectsDetected, OnOff, PanTiltZoom, PanTiltZoomCommand, Reboot, RequestPictureOptions, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, Setting, VideoClip, VideoClipOptions, VideoClips, VideoClipThumbnailOptions } from "@scrypted/sdk";
+import sdk, { Camera, Device, DeviceCreatorSettings, DeviceInformation, DeviceProvider, FFmpegInput, HttpRequest, HttpRequestHandler, HttpResponse, Intercom, MediaObject, ObjectDetectionTypes, ObjectDetector, ObjectsDetected, OnOff, PanTiltZoom, PanTiltZoomCommand, Reboot, RequestPictureOptions, ScryptedDeviceBase, ScryptedDeviceType, ScryptedInterface, ScryptedMimeTypes, Setting, VideoClip, VideoClipOptions, VideoClips, VideoClipThumbnailOptions } from "@scrypted/sdk";
 import { StorageSettings } from '@scrypted/sdk/storage-settings';
 import { EventEmitter } from "stream";
 import { createRtspMediaStreamOptions, Destroyable, RtspProvider, RtspSmartCamera, UrlMediaStreamOptions } from "../../rtsp/src/rtsp";
@@ -8,6 +8,15 @@ import { listenEvents } from './onvif-events';
 import { OnvifIntercom } from './onvif-intercom';
 import { DevInfo } from './probe';
 import { AIState, Enc, ReolinkCameraClient, VideoSearchResult, VideoSearchTime } from './reolink-api';
+import fs from "fs"
+import url from "url"
+import path from 'path';
+import stream from 'stream';
+import { finished } from "stream/promises";
+import { httpFetch } from '../../../server/src/fetch/http-fetch';
+
+const REOLINK_CLIPS = path.join(process.env.SCRYPTED_PLUGIN_VOLUME, 'clips');
+const REOLINK_THUMBNAILS = path.join(process.env.SCRYPTED_PLUGIN_VOLUME, 'thumbnails');
 
 class ReolinkCameraSiren extends ScryptedDeviceBase implements OnOff {
     sirenTimeout: NodeJS.Timeout;
@@ -28,7 +37,7 @@ class ReolinkCameraSiren extends ScryptedDeviceBase implements OnOff {
     }
 
     private async setSiren(on: boolean) {
-        const api = this.camera.getClient();
+        const api = await this.camera.getClient();
 
         // doorbell doesn't seem to support alarm_mode = 'manul'
         if (this.camera.storageSettings.values.doorbell) {
@@ -50,13 +59,14 @@ class ReolinkCameraSiren extends ScryptedDeviceBase implements OnOff {
     }
 }
 
-class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, Reboot, Intercom, ObjectDetector, PanTiltZoom, VideoClips {
+export class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, Reboot, Intercom, ObjectDetector, PanTiltZoom, VideoClips {
     client: ReolinkCameraClient;
     onvifClient: OnvifCameraAPI;
     onvifIntercom = new OnvifIntercom(this);
     videoStreamOptions: Promise<UrlMediaStreamOptions[]>;
     motionTimeout: NodeJS.Timeout;
     siren: ReolinkCameraSiren;
+    videoclipsToFetch: string[] = [];
 
     storageSettings = new StorageSettings(this, {
         doorbell: {
@@ -145,6 +155,18 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
             subgroup: 'Advanced',
             title: 'Use ONVIF for Two-Way Audio',
             type: 'boolean',
+        },
+        token: {
+            title: 'Token',
+            type: 'string',
+            // readonly: true,
+            // hide: true,
+        },
+        tokenLease: {
+            title: 'Token lease',
+            type: 'number',
+            // readonly: true,
+            // hide: true,
         }
     });
 
@@ -178,7 +200,7 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
             } catch (e) {
                 this.console.log('Fail fetching presets', e);
             }
-            const api = this.getClient();
+            const api = await this.getClient();
             const deviceInfo = await api.getDeviceInfo();
             this.storageSettings.values.deviceInfo = deviceInfo;
             await this.updateAbilities();
@@ -192,10 +214,48 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
                     devices: []
                 });
             }
+            await this.initFolders();
         })()
             .catch(e => {
                 this.console.log('device refresh failed', e);
             });
+    }
+
+    private async initFolders() {
+        if (!fs.existsSync(REOLINK_CLIPS)) {
+            this.console.log(`Creating clips dir at: ${REOLINK_CLIPS}`)
+            fs.mkdirSync(REOLINK_CLIPS);
+        }
+        if (!fs.existsSync(REOLINK_THUMBNAILS)) {
+            this.console.log(`Creating thumbnails dir at: ${REOLINK_THUMBNAILS}`)
+            fs.mkdirSync(REOLINK_THUMBNAILS);
+        }
+        setInterval(async () => {
+            if (this.videoclipsToFetch.length) {
+                this.console.log(`Fetching ${this.videoclipsToFetch.length} clips`);
+
+                do {
+                    const videoClipPath = this.videoclipsToFetch.shift();
+                    try {
+                        await this.fetchAndSaveClip(videoClipPath);
+                    } catch (e) {
+                        this.videoclipsToFetch.push(videoClipPath);
+                    }
+                } while (this.videoclipsToFetch.length > 0);
+            }
+        }, 2000);
+    }
+
+    public async getTokenData() {
+        const token = this.storageSettings.getItem('token');
+        const tokenLease = this.storageSettings.getItem('tokenLease');
+
+        return { token, tokenLease }
+    }
+
+    public async putTokenData(token: string, tokenLease: number) {
+        await this.storageSettings.putSetting('token', token);
+        await this.storageSettings.putSetting('tokenLease', tokenLease);
     }
 
     updatePtzCaps() {
@@ -209,14 +269,14 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
     }
 
     async getPresets() {
-        const client = this.getClient();
+        const client = await this.getClient();
         const ptzPresets = await client.getPtzPresets();
         this.console.log(`Presets: ${JSON.stringify(ptzPresets)}`)
         this.storageSettings.values.cachedPresets = ptzPresets;
     }
 
     async updateAbilities() {
-        const api = this.getClient();
+        const api = await this.getClient();
         const abilities = await api.getAbility();
         this.storageSettings.values.abilities = abilities;
         this.console.log('getAbility', JSON.stringify(abilities));
@@ -241,7 +301,7 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
     }
 
     async ptzCommand(command: PanTiltZoomCommand): Promise<void> {
-        const client = this.getClient();
+        const client = await this.getClient();
         client.ptz(command);
     }
 
@@ -286,6 +346,14 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
             && this.storageSettings.values.abilities?.value?.Ability?.supportAudioAlarm?.ver !== 0;
     }
 
+    hasBattery() {
+        const channel = this.getRtspChannel();
+        const mainBattery = this.storageSettings.values.abilities?.value?.Ability?.battery;
+        const channelBattery = this.storageSettings.values.abilities?.value?.abilityChn?.[channel]?.battery;
+
+        return (mainBattery || channelBattery)?.ver !== 0;
+    }
+
     async updateDevice() {
         const interfaces = this.provider.getInterfaces();
         let type = ScryptedDeviceType.Camera;
@@ -311,12 +379,14 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
         }
         if (this.hasSiren())
             interfaces.push(ScryptedInterface.DeviceProvider);
+        if (this.hasBattery())
+            interfaces.push(ScryptedInterface.Battery);
 
         await this.provider.updateDevice(this.nativeId, name, interfaces, type);
     }
 
     async reboot() {
-        const client = this.getClient();
+        const client = await this.getClient();
         await client.reboot();
     }
 
@@ -335,9 +405,18 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
         this.info = info;
     }
 
-    getClient() {
-        if (!this.client)
-            this.client = new ReolinkCameraClient(this.getHttpAddress(), this.getUsername(), this.getPassword(), this.getRtspChannel(), this.console);
+    async getClient() {
+        if (!this.client) {
+            this.client = new ReolinkCameraClient(
+                this.getHttpAddress(),
+                this.getUsername(),
+                this.getPassword(),
+                this.getRtspChannel(),
+                this.console,
+                this,
+            );
+        }
+
         return this.client;
     }
 
@@ -353,7 +432,7 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
 
     async listenEvents() {
         let killed = false;
-        const client = this.getClient();
+        const client = await this.getClient();
 
         // reolink ai might not trigger motion if objects are detected, weird.
         const startAI = async (ret: Destroyable, triggerMotion: () => void) => {
@@ -494,7 +573,8 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
     }
 
     async takeSmartCameraPicture(options?: RequestPictureOptions): Promise<MediaObject> {
-        return this.createMediaObject(await this.getClient().jpegSnapshot(options?.timeout), 'image/jpeg');
+        const client = await this.getClient();
+        return this.createMediaObject(client.jpegSnapshot(options?.timeout), 'image/jpeg');
     }
 
     async getUrlSettings(): Promise<Setting[]> {
@@ -529,15 +609,13 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
             url.password = this.storage.getItem('password') || '';
         } else {
             const params = url.searchParams;
-            for (const [k, v] of Object.entries(this.client.parameters)) {
-                params.set(k, v);
-            }
+            params.set('token', this.storageSettings.values.token);
         }
         return url.toString();
     }
 
     async createVideoStream(vso: UrlMediaStreamOptions): Promise<MediaObject> {
-        await this.client.login();
+        await this.client.getTokenData();
         return super.createVideoStream(vso);
     }
 
@@ -553,15 +631,16 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
     async getConstructedVideoStreamOptionsInternal(): Promise<UrlMediaStreamOptions[]> {
         let deviceInfo: DevInfo;
         try {
-            const client = this.getClient();
+            const client = await this.getClient();
             deviceInfo = await client.getDeviceInfo();
+
         } catch (e) {
             this.console.error("Unable to gather device information.", e);
         }
 
         let encoderConfig: Enc;
         try {
-            const client = this.getClient();
+            const client = await this.getClient();
             encoderConfig = await client.getEncoderConfiguration();
         } catch (e) {
             this.console.error("Codec query failed. Falling back to known defaults.", e);
@@ -694,13 +773,7 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
     }
 
     async putSetting(key: string, value: string) {
-        this.client = undefined;
-        if (this.storageSettings.keys[key]) {
-            await this.storageSettings.putSetting(key, value);
-        }
-        else {
-            await super.putSetting(key, value);
-        }
+        await this.storageSettings.putSetting(key, value);
         this.updateDevice();
         this.updateDeviceInfo();
     }
@@ -746,6 +819,98 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
         return sirenNativeId;
     }
 
+    private async getVideoclipUrls(videoclipPath: string) {
+        const { fileName } = await this.client.getVideoClipUrl(videoclipPath);
+        const outputVideoFile = `${REOLINK_CLIPS}/${fileName}.mp4`;
+        const outputThumbnailFile = `${REOLINK_THUMBNAILS}/${fileName}.jpg`;
+
+        return { outputVideoFile, outputThumbnailFile }
+    }
+
+    async findLocalVideoClip(videoclipPath: string): Promise<MediaObject | undefined> {
+        const { outputVideoFile } = await this.getVideoclipUrls(videoclipPath);
+
+        if (fs.existsSync(outputVideoFile)) {
+            const fileURLToPath = url.pathToFileURL(outputVideoFile).toString()
+            return await sdk.mediaManager.createMediaObjectFromUrl(fileURLToPath);
+        }
+
+        return;
+    }
+
+    async findLocalThumbnail(videoclipPath: string): Promise<MediaObject | undefined> {
+        const { outputThumbnailFile } = await this.getVideoclipUrls(videoclipPath);
+
+        if (fs.existsSync(outputThumbnailFile)) {
+            const fileURLToPath = url.pathToFileURL(outputThumbnailFile).toString()
+            return await sdk.mediaManager.createMediaObjectFromUrl(fileURLToPath);
+        }
+
+        return;
+    }
+
+    private async generateVideoThumbnail(videoclipPath) {
+        const videoMo = await this.findLocalVideoClip(videoclipPath);
+        let thumbnailMo = await this.findLocalThumbnail(videoclipPath);
+
+        try {
+            if (!thumbnailMo && videoMo) {
+                const { outputVideoFile, outputThumbnailFile } = await this.getVideoclipUrls(videoclipPath);
+
+                const ffmpegInput: FFmpegInput = {
+                    url: undefined,
+                    inputArguments: [
+                        '-ss', '00:00:02',
+                        '-i', outputVideoFile,
+                    ],
+                };
+                const input = await sdk.mediaManager.createFFmpegMediaObject(ffmpegInput);
+                const jpeg = await sdk.mediaManager.convertMediaObjectToBuffer(input, 'image/jpeg');
+                await fs.promises.writeFile(outputThumbnailFile, jpeg);
+
+                thumbnailMo = await this.findLocalThumbnail(videoclipPath);
+            }
+
+        } catch (e) {
+            this.console.log('Error generating thumbnail', e);
+        }
+
+        return thumbnailMo;
+    }
+
+    private async fetchAndSaveClip(videoclipPath: string) {
+        const { url: fileUrl } = await this.client.getVideoClipUrl(videoclipPath);
+
+        let { outputVideoFile } = await this.getVideoclipUrls(videoclipPath);
+        let videoMo = await this.findLocalVideoClip(videoclipPath);
+        let thumbnailMo = await this.findLocalThumbnail(videoclipPath);
+
+        try {
+            if (!fs.existsSync(outputVideoFile)) {
+                this.console.log(`Starting clip download from ${fileUrl}`);
+                const response = await fetch(fileUrl);
+                await finished(stream.Readable.from(response.body as ReadableStream<Uint8Array>).pipe(fs.createWriteStream(outputVideoFile)));
+                this.console.log("Download finished.")
+            }
+
+            videoMo = await this.findLocalVideoClip(videoclipPath);
+        } catch (e) {
+            this.console.log('Error fetching clip', e);
+        }
+
+        try {
+            this.console.log(`Starting thumbnail generation for ${videoclipPath}`);
+
+            // if (!fs.existsSync(outputThumbnailFile)) {
+            thumbnailMo = await this.generateVideoThumbnail(videoclipPath);
+            // }
+        } catch (e) {
+            this.console.log('Error fetching clip', e);
+        }
+
+        return { videoMo, thumbnailMo };
+    }
+
     async getVideoClips(options?: VideoClipOptions): Promise<VideoClip[]> {
         const response = await this.client.getVideoClips(options);
 
@@ -763,64 +928,82 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
         }
         const ep = await sdk.endpointManager.getLocalEndpoint();
 
-        return response.map<VideoClip>(videoClip => {
-            const startTime = processDate(videoClip.StartTime);
-            const entdTime = processDate(videoClip.EndTime);
+        const videoclips: VideoClip[] = [];
 
-            const durationInMs = entdTime - startTime;
-            const videoClipname = videoClip.name;
+        for (const videoClip of response) {
+            try {
+                const startTime = processDate(videoClip.StartTime);
+                const entdTime = processDate(videoClip.EndTime);
 
+                const durationInMs = entdTime - startTime;
+                const videoClipPath = videoClip.name;
 
-            return {
-                id: videoClipname,
-                startTime,
-                duration: Math.round(durationInMs),
-                videoId: videoClipname,
-                thumbnailId: videoClipname,
-                resources: {
-                    thumbnail: {
-                        href: 'https://ha.gianlucaruocco.top/local/snapshots/baby_monitor.jpg',
-                        // href: new URL(`thumbnail/${this.id}/${videoClipname}`, ep).pathname,
-                    },
-                    // video: {
-                    //     href: videoClipname
-                    // }
+                const videoMo = await this.findLocalVideoClip(videoClipPath);
+                const thumbnailMo = await this.findLocalThumbnail(videoClipPath);
+                let videoUrl: string;
+                let thumbnailUrl: string;
+
+                if (!videoMo) {
+                    if (!this.videoclipsToFetch.includes(videoClipPath)) {
+                        this.videoclipsToFetch.push(videoClipPath);
+                    }
+                } else {
+                    videoUrl = await sdk.mediaManager.convertMediaObjectToUrl(videoMo, 'video/mp4');
+                    if (thumbnailMo) {
+                        thumbnailUrl = await sdk.mediaManager.convertMediaObjectToUrl(thumbnailMo, 'image/jpg');
+                    }
+                    const ep = await sdk.endpointManager.getLocalEndpoint();
+                    const event = 'motion';
+
+                    videoclips.push({
+                        id: videoClipPath,
+                        startTime,
+                        duration: Math.round(durationInMs),
+                        videoId: videoClipPath,
+                        thumbnailId: videoClipPath,
+                        // detectionClasses,
+                        event,
+                        description: event,
+                        resources: {
+                            thumbnail: {
+                                href: thumbnailUrl
+                            },
+                            video: {
+                                href: videoUrl
+                            }
+                        }
+                    })
                 }
+
+
+            } catch (e) {
+                this.console.log('error generating clip', e)
             }
-        });
+        }
+
+        return videoclips;
     }
 
     async getVideoClip(videoId: string): Promise<MediaObject> {
         this.console.log('Requiring videoclip ', videoId);
 
-        try {
-            const videoclipUrl = await this.client.getVideoClipUrl(videoId);
-            this.console.log('Videoclip url', videoclipUrl);
-            return sdk.mediaManager.createMediaObjectFromUrl(videoclipUrl);
-        } catch (e) {
-            this.console.log(`Failed fetching videoclip ${videoId}`, e);
-        }
+        const { url: videoClipUrl } = await this.client.getVideoClipUrl(videoId);
+        const ffmpegInput: FFmpegInput = {
+            url: undefined,
+            inputArguments: [
+                // '-ss', '00:00:02',
+                '-i', videoClipUrl,
+            ],
+        };
+        const input = await sdk.mediaManager.createFFmpegMediaObject(ffmpegInput);
+        return input;
     }
 
     async getVideoClipThumbnail(thumbnailId: string, _?: VideoClipThumbnailOptions): Promise<MediaObject> {
-        this.console.log('Requiring videoclip thumbnailId', thumbnailId);
+        this.console.log('Requiring thumbnail ', thumbnailId);
 
-        try {
-            // const videoclipUrl = await this.client.getVideoClipUrl(thumbnailId);
-            const ffmpegInput: FFmpegInput = {
-                inputArguments: [
-                    // it may be h264 or h265.
-                    // '-f', 'h264',
-                    '-i', 'https://ha.gianlucaruocco.top/local/snapshots/baby_monitor.jpg',
-                ]
-            };
-            const input = await sdk.mediaManager.createFFmpegMediaObject(ffmpegInput);
-            const jpeg = await sdk.mediaManager.convertMediaObjectToBuffer(input, 'image/jpeg');
-            return await sdk.mediaManager.createMediaObject(jpeg, 'image/jpeg');
-            // return await sdk.mediaManager.createMediaObjectFromUrl('https://ha.gianlucaruocco.top/local/snapshots/baby_monitor.jpg');
-        } catch (e) {
-            this.console.error(`Error generating thumbnail ${thumbnailId}`, e);
-        }
+        const { thumbnailMo } = await this.fetchAndSaveClip(thumbnailId);
+        return thumbnailMo;
     }
 
     async removeVideoClips(...videoClipIds: string[]): Promise<void> {
@@ -842,6 +1025,10 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
 }
 
 class ReolinkProvider extends RtspProvider {
+    constructor() {
+        super()
+    }
+
     getScryptedDeviceCreator(): string {
         return 'Reolink Camera';
     }
@@ -870,8 +1057,19 @@ class ReolinkProvider extends RtspProvider {
         let ai;
         let abilities;
         const rtspChannel = parseInt(settings.rtspChannel?.toString()) || 0;
+
+        nativeId = await super.createDevice(settings, nativeId);
+        const device = await this.getDevice(nativeId) as ReolinkCamera;
+
         if (!skipValidate) {
-            const api = new ReolinkCameraClient(httpAddress, username, password, rtspChannel, this.console);
+            const api = new ReolinkCameraClient(
+                httpAddress,
+                username,
+                password,
+                rtspChannel,
+                this.console,
+                device
+            );
             try {
                 await api.jpegSnapshot();
             }
@@ -893,9 +1091,6 @@ class ReolinkProvider extends RtspProvider {
         }
         settings.newCamera ||= name;
 
-        nativeId = await super.createDevice(settings, nativeId);
-
-        const device = await this.getDevice(nativeId) as ReolinkCamera;
         device.info = info;
         device.putSetting('username', username);
         device.putSetting('password', password);
@@ -958,3 +1153,4 @@ class ReolinkProvider extends RtspProvider {
 }
 
 export default ReolinkProvider;
+

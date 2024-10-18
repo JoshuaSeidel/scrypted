@@ -46,7 +46,7 @@ async function getDeviceInfo(host: string, username: string, password: string): 
     return response.body?.[0]?.value?.DevInfo;
 }
 
-export async function getToken(host: string, username: string, password: string) {
+export async function getToken(host: string, userName: string, password: string) {
     const url = new URL(`http://${host}/api.cgi`);
     const params = url.searchParams;
     params.set('cmd', 'Login');
@@ -62,8 +62,8 @@ export async function getToken(host: string, username: string, password: string)
                 action: 0,
                 param: {
                     User: {
-                        userName: username,
-                        password: password
+                        userName,
+                        password
                     }
                 }
             },
@@ -71,8 +71,9 @@ export async function getToken(host: string, username: string, password: string)
     });
 
     const token = response.body?.[0]?.value?.Token?.name || response.body?.value?.Token?.name;
-    if (!token)
-        throw new Error('unable to login');
+    if (!token) {
+        throw new Error(`unable to login. ${ JSON.stringify(response)}`);
+    }
     const { body } = response;
     const leaseTimeSeconds: number = body?.[0]?.value?.Token.leaseTime || body?.value?.Token.leaseTime;
     return {
@@ -83,32 +84,32 @@ export async function getToken(host: string, username: string, password: string)
     }
 }
 
-export async function getLoginParameters(host: string, username: string, password: string) {
-    try {
-        await getDeviceInfo(host, username, password);
-        return {
-            parameters: {
-                user: username,
-                password,
-            },
-            leaseTimeSeconds: Infinity,
-        }
-    }
-    catch (e) {
-    }
+// export async function getLoginParameters(host: string, username: string, password: string) {
+//     try {
+//         await getDeviceInfo(host, username, password);
+//         return {
+//             parameters: {
+//                 user: username,
+//                 password,
+//             },
+//             leaseTimeSeconds: Infinity,
+//         }
+//     }
+//     catch (e) {
+//     }
 
-    try {
-        return await getToken(host, username, password);
-    }
-    catch (e) {
-        // if the token exchange fails, fall back to basic auth
-        // TODO: maybe detect error type?
-        return {
-            parameters: {
-                user: username,
-                password,
-            },
-            leaseTimeSeconds: 60,
-        }
-    }
-}
+//     try {
+//         return await getToken(host, username, passw);
+//     }
+//     catch (e) {
+//         // if the token exchange fails, fall back to basic auth
+//         // TODO: maybe detect error type?
+//         return {
+//             parameters: {
+//                 user: username,
+//                 password,
+//             },
+//             leaseTimeSeconds: 60,
+//         }
+//     }
+// }
