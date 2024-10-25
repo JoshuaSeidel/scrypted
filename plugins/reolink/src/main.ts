@@ -486,7 +486,7 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
             ret.on('onvifEvent', (eventTopic: string, dataValue: any) => {
                 let className: string;
                 if (eventTopic.includes('PeopleDetect')) {
-                    className = 'people';
+                    className = 'person';
                 }
                 else if (eventTopic.includes('FaceDetect')) {
                     className = 'face';
@@ -495,7 +495,7 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
                     className = 'vehicle';
                 }
                 else if (eventTopic.includes('DogCatDetect')) {
-                    className = 'dog_cat';
+                    className = 'animal';
                 }
                 else if (eventTopic.includes('Package')) {
                     className = 'package';
