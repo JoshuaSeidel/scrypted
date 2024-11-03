@@ -754,7 +754,7 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
             else if (stream.container === 'flv') {
                 streamUrl = new URL(`https://${this.getFlvAddress()}/flv?port=1935&app=bcs&stream=${stream.id}&user=${this.storage.getItem('username')}&password=${this.storage.getItem('password')}`)
                 stream.url = streamUrl.toString();
-                stream.name = `RTSP ${stream.id}`;
+                stream.name = `FLV ${stream.id}`;
             }
         }
 
