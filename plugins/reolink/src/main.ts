@@ -686,6 +686,13 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
         if (deviceInfo?.model == "Reolink TrackMix PoE") {
             streams.push({
                 name: '',
+                id: 'autotrack.bcs',
+                container: 'rtmp',
+                video: { width: 2560, height: 1920 },
+                url: '',
+            },
+            streams.push({
+                name: '',
                 id: 'autotrack_main.bcs',
                 container: 'rtmp',
                 video: { width: 3840, height: 2160 },
