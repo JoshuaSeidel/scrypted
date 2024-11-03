@@ -72,6 +72,12 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
             placeholder: '1935',
             type: 'number',
         },
+        flvPort: {
+            subgroup: 'Advanced',
+            title: 'FLV Port Override',
+            placeholder: '1935',
+            type: 'number',
+        },
         motionTimeout: {
             subgroup: 'Advanced',
             title: 'Motion Timeout',
@@ -657,7 +663,7 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
         // 2: support main/sub stream
 
         const live = this.storageSettings.values.abilities?.value?.Ability?.abilityChn?.[rtspChannel].live?.ver;
-        const [rtmpMain, rtmpExt, rtmpSub, rtspMain, rtspSub] = streams;
+        const [rtmpMain, rtmpExt, rtmpSub, rtspMain, rtspSub, flvMain, flvExt] = streams;
         streams.splice(0, streams.length);
 
         // abilityChn->mainEncType
@@ -679,7 +685,7 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
             streams.push(rtmpExt, rtmpSub, rtspMain, rtspSub);
         }
         else {
-            streams.push(rtmpMain, rtmpExt, rtmpSub, rtspMain, rtspSub);
+            streams.push(rtmpMain, rtmpExt, rtmpSub, rtspMain, rtspSub, flvMain, flvExt);
         }
 
 
@@ -691,17 +697,17 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
                 video: { width: 2560, height: 1920 },
                 url: '',
             },
-            streams.push({
+            {
                 name: '',
                 id: 'autotrack_main.bcs',
-                container: 'rtmp',
+                container: 'flv',
                 video: { width: 3840, height: 2160 },
                 url: '',
             },
-            streams.push({
+            {
                 name: '',
-                id: 'autotrack_sub.bcs',
-                container: 'rtmp',
+                id: 'autotrack_ext.bcs',
+                container: 'flv',
                 video: { width: 896, height: 512 },
                 url: '',
             });
@@ -742,6 +748,11 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
                 stream.name = `RTMP ${stream.id}`;
             } else if (stream.container === 'rtsp') {
                 streamUrl = new URL(`rtsp://${this.getRtspAddress()}/${stream.id}`)
+                stream.url = streamUrl.toString();
+                stream.name = `RTSP ${stream.id}`;
+            }
+            else if (stream.container === 'flv') {
+                streamUrl = new URL(`https://${this.getFlvAddress()}/flv?port=1935&app=bcs&stream=${stream.id}&user=${this.storage.getItem('username')}&password=${this.storage.getItem('password')}`)
                 stream.url = streamUrl.toString();
                 stream.name = `RTSP ${stream.id}`;
             }
@@ -803,6 +814,10 @@ class ReolinkCamera extends RtspSmartCamera implements Camera, DeviceProvider, R
 
     getRtmpAddress() {
         return `${this.getIPAddress()}:${this.storage.getItem('rtmpPort') || 1935}`;
+    }
+
+    getFlvAddress() {
+        return `${this.getIPAddress()}:${this.storage.getItem('flvPort') || 1935}`;
     }
 
     reportSirenDevice() {
